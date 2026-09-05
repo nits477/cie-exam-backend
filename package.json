@@ -1,6 +1,6 @@
 {
-  "name": "cie-exam-v2-2-online",
-  "version": "2.2.0",
+  "name": "cie-exam-v2-6-datewise-results",
+  "version": "2.6.0",
   "private": true,
   "scripts": {
     "start": "node server.js"

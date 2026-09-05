@@ -144,11 +144,33 @@ app.post("/api/result",async(req,res)=>{
 
 app.get("/api/results",async(req,res)=>{
   try{
+    const from=String(req.query.from||"").trim();
+    const to=String(req.query.to||"").trim();
+    const validDate=x=>/^\d{4}-\d{2}-\d{2}$/.test(x);
+    if((from&&!validDate(from))||(to&&!validDate(to)))
+      return res.status(400).json({error:"Date must be YYYY-MM-DD"});
+
     if(useDb){
-      const q=await pool.query(`SELECT id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,created_at AS "createdAt" FROM results ORDER BY id DESC`);
+      let sql=`SELECT id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,created_at AS "createdAt" FROM results`;
+      const params=[], where=[];
+      if(from){params.push(from);where.push(`created_at >= ($${params.length}::date AT TIME ZONE 'Asia/Kolkata')`)}
+      if(to){params.push(to);where.push(`created_at < (($${params.length}::date + 1) AT TIME ZONE 'Asia/Kolkata')`)}
+      if(where.length) sql+=' WHERE '+where.join(' AND ');
+      sql+=' ORDER BY id DESC';
+      const q=await pool.query(sql,params);
       return res.json(q.rows);
     }
-    res.json(readLocal("results.json"));
+
+    let rows=readLocal("results.json");
+    if(from||to){
+      const start=from?new Date(from+'T00:00:00+05:30'):null;
+      const end=to?new Date(to+'T23:59:59.999+05:30'):null;
+      rows=rows.filter(x=>{
+        const d=new Date(x.createdAt||x.created_at||0);
+        return (!start||d>=start)&&(!end||d<=end);
+      });
+    }
+    res.json(rows);
   }catch(e){res.status(500).json({error:e.message})}
 });
 
