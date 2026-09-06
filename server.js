@@ -84,6 +84,7 @@ async function initDb(){
       status TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE results ADD COLUMN IF NOT EXISTS review_json JSONB;
     ALTER TABLE results DROP CONSTRAINT IF EXISTS results_mobile_key;
     CREATE INDEX IF NOT EXISTS idx_results_mobile_created ON results(mobile,created_at DESC);
 
@@ -102,7 +103,7 @@ async function initDb(){
 app.use(cors());
 app.use(express.json({limit:"2mb"}));
 app.use(express.static(path.join(__dirname,"public")));
-app.get("/api/health",(req,res)=>res.json({ok:true,mode:useDb?"postgres":"local-json",version:"3.0"}));
+app.get("/api/health",(req,res)=>res.json({ok:true,mode:useDb?"postgres":"local-json",version:"3.1"}));
 
 app.post("/api/register",async(req,res)=>{
   try{
@@ -180,15 +181,32 @@ app.post("/api/result",async(req,res)=>{
       else {const x=readLocal("students.json").find(s=>String(s.mobile)===mobile);if(x&&!x.pinHash)student=x}
     }
     if(!student) return res.status(401).json({error:"Student login verification failed."});
-    const total=Math.max(0,Number(b.total)||0), score=Math.max(0,Number(b.score)||0);
-    if(score>total) return res.status(400).json({error:"Invalid score."});
+
+    let score=0,total=0,review=null;
+    if(Array.isArray(b.answers)){
+      const submitted=b.answers.map(v=>Number.isInteger(Number(v))?Number(v):-1);
+      let questions;
+      if(useDb){questions=(await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions ORDER BY id`)).rows}
+      else questions=readLocal("questions.json");
+      total=questions.length;
+      review=questions.map((q,i)=>{
+        const selectedIndex=(submitted[i]>=0&&submitted[i]<=3)?submitted[i]:-1;
+        const correctIndex="ABCD".indexOf(String(q.answer||"").toUpperCase());
+        if(selectedIndex===correctIndex && correctIndex>=0)score++;
+        return {question:q.question,a:q.a,b:q.b,c:q.c,d:q.d,selected:selectedIndex>=0?"ABCD"[selectedIndex]:"",correct:correctIndex>=0?"ABCD"[correctIndex]:"",isCorrect:selectedIndex===correctIndex&&correctIndex>=0};
+      });
+    }else{
+      // Backward compatibility with older APK versions.
+      total=Math.max(0,Number(b.total)||0);score=Math.max(0,Number(b.score)||0);
+      if(score>total) return res.status(400).json({error:"Invalid score."});
+    }
     const percentage=total?+(score*100/total).toFixed(2):0, status=total&&score/total>=0.4?"PASS":"FAIL";
     const studentId=student.id, name=student.name, fatherName=student.father_name??student.fatherName;
     if(useDb){
-      const q=await pool.query(`INSERT INTO results(student_id,name,father_name,mobile,score,total,percentage,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,created_at AS "createdAt"`,[studentId,name,fatherName,mobile,score,total,percentage,status]);
+      const q=await pool.query(`INSERT INTO results(student_id,name,father_name,mobile,score,total,percentage,status,review_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,review_json AS review,created_at AS "createdAt"`,[studentId,name,fatherName,mobile,score,total,percentage,status,review?JSON.stringify(review):null]);
       return res.json(q.rows[0]);
     }
-    const rows=readLocal("results.json"),x={id:Date.now(),studentId,name,fatherName,mobile,score,total,percentage,status,createdAt:new Date().toISOString()};rows.push(x);writeLocal("results.json",rows);res.json(x);
+    const rows=readLocal("results.json"),x={id:Date.now(),studentId,name,fatherName,mobile,score,total,percentage,status,review,createdAt:new Date().toISOString()};rows.push(x);writeLocal("results.json",rows);res.json(x);
   }catch(e){res.status(500).json({error:e.message})}
 });
 
@@ -197,7 +215,7 @@ app.post("/api/my-results",async(req,res)=>{
     const mobile=norm(req.body?.mobile),pin=String(req.body?.pin||"");
     const student=await verifyStudent(mobile,pin);
     if(!student) return res.status(401).json({error:"Invalid Mobile Number or PIN."});
-    if(useDb){const q=await pool.query(`SELECT id,score,total,percentage,status,created_at AS "createdAt" FROM results WHERE mobile=$1 ORDER BY created_at DESC,id DESC`,[mobile]);return res.json({student:studentPublic(student),results:q.rows})}
+    if(useDb){const q=await pool.query(`SELECT id,score,total,percentage,status,review_json AS review,created_at AS "createdAt" FROM results WHERE mobile=$1 ORDER BY created_at DESC,id DESC`,[mobile]);return res.json({student:studentPublic(student),results:q.rows})}
     const rows=readLocal("results.json").filter(x=>String(x.mobile)===mobile).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));res.json({student:studentPublic(student),results:rows});
   }catch(e){res.status(500).json({error:e.message})}
 });
@@ -246,6 +264,26 @@ app.post("/api/admin/reset-pin",async(req,res)=>{
   }catch(e){res.status(500).json({error:e.message})}
 });
 
+app.delete("/api/admin/results/:id",async(req,res)=>{
+  try{
+    const id=String(req.params.id||"");
+    if(!/^\d+$/.test(id))return res.status(400).json({error:"Invalid result id."});
+    if(useDb){const q=await pool.query(`DELETE FROM results WHERE id=$1 RETURNING id`,[id]);if(!q.rowCount)return res.status(404).json({error:"Result not found."});return res.json({ok:true,message:"Result deleted."})}
+    const rows=readLocal("results.json"),next=rows.filter(x=>String(x.id)!==id);if(next.length===rows.length)return res.status(404).json({error:"Result not found."});writeLocal("results.json",next);res.json({ok:true,message:"Result deleted."});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
+app.delete("/api/admin/students/:id",async(req,res)=>{
+  try{
+    const id=String(req.params.id||"");
+    if(!/^\d+$/.test(id))return res.status(400).json({error:"Invalid student id."});
+    if(useDb){
+      const c=await pool.connect();try{await c.query('BEGIN');const st=await c.query(`SELECT mobile FROM students WHERE id=$1`,[id]);if(!st.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:"Student not found."})}const mobile=st.rows[0].mobile;await c.query(`DELETE FROM pin_reset_requests WHERE student_id=$1 OR mobile=$2`,[id,mobile]);await c.query(`DELETE FROM results WHERE student_id=$1 OR mobile=$2`,[id,mobile]);await c.query(`DELETE FROM students WHERE id=$1`,[id]);await c.query('COMMIT');return res.json({ok:true,message:"Student and all linked results/reset requests deleted."});}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}
+    }
+    const students=readLocal("students.json"),st=students.find(x=>String(x.id)===id);if(!st)return res.status(404).json({error:"Student not found."});writeLocal("students.json",students.filter(x=>String(x.id)!==id));writeLocal("results.json",readLocal("results.json").filter(x=>String(x.studentId)!==id&&String(x.mobile)!==String(st.mobile)));writeLocal("pin_reset_requests.json",readLocal("pin_reset_requests.json").filter(x=>String(x.studentId)!==id&&String(x.mobile)!==String(st.mobile)));res.json({ok:true,message:"Student and linked data deleted."});
+  }catch(e){res.status(500).json({error:e.message})}
+});
+
 app.post("/api/admin/upload-excel",upload.single("file"),async(req,res)=>{
   if(!req.file)return res.status(400).json({error:"Select Excel"});
   try{
@@ -259,4 +297,4 @@ app.post("/api/admin/clear-questions",async(req,res)=>{try{if(useDb)await pool.q
 // Kept only so older admin pages do not error. Multiple attempts are now intentional.
 app.post("/api/admin/remove-duplicate-results",async(req,res)=>res.json({before:0,after:0,removed:0,message:"V3.0 allows multiple exam attempts. No results were removed."}));
 
-initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?"Postgres":"local JSON"}) - V3.0`))).catch(err=>{console.error("Database startup error:",err);process.exit(1)});
+initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?"Postgres":"local JSON"}) - V3.1`))).catch(err=>{console.error("Database startup error:",err);process.exit(1)});
