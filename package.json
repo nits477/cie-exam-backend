@@ -1,14 +1,11 @@
 {
-  "name": "cie-exam-v2-6-datewise-results",
-  "version": "2.6.0",
+  "name": "cie-exam-v3-all-corrections",
+  "version": "3.0.0",
   "private": true,
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=20"
-  },
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"},
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "multer": "^1.4.5-lts.1",
