@@ -1,6 +1,6 @@
 {
-  "name": "cie-exam-v3-1-review-delete",
-  "version": "3.1.0",
+  "name": "cie-exam-v3-2-multiple-exams-timers",
+  "version": "3.2.0",
   "private": true,
   "scripts": {
     "start": "node server.js"

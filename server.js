@@ -1,300 +1,102 @@
-const express=require("express");
-const cors=require("cors");
-const multer=require("multer");
-const XLSX=require("xlsx");
-const fs=require("fs");
-const path=require("path");
-const {Pool}=require("pg");
-const bcrypt=require("bcryptjs");
+const express=require('express');
+const cors=require('cors');
+const multer=require('multer');
+const XLSX=require('xlsx');
+const fs=require('fs');
+const path=require('path');
+const crypto=require('crypto');
+const {Pool}=require('pg');
+const bcrypt=require('bcryptjs');
 
 const app=express();
-const PORT=process.env.PORT || 3000;
-const uploadDir=path.join(__dirname,"uploads");
-fs.mkdirSync(uploadDir,{recursive:true});
+const PORT=process.env.PORT||3000;
+const uploadDir=path.join(__dirname,'uploads');fs.mkdirSync(uploadDir,{recursive:true});
 const upload=multer({dest:uploadDir});
-
-const DATABASE_URL=process.env.DATABASE_URL || "";
+const DATABASE_URL=process.env.DATABASE_URL||'';
 const useDb=!!DATABASE_URL;
-let pool=null;
-if(useDb){
-  pool=new Pool({
-    connectionString:DATABASE_URL,
-    ssl: process.env.NODE_ENV==="production" ? {rejectUnauthorized:false} : false
-  });
+const pool=useDb?new Pool({connectionString:DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false}):null;
+const DATA_DIR=path.join(__dirname,'data');fs.mkdirSync(DATA_DIR,{recursive:true});
+function readLocal(n,f=[]){try{return JSON.parse(fs.readFileSync(path.join(DATA_DIR,n),'utf8'))}catch{return f}}
+function writeLocal(n,d){fs.writeFileSync(path.join(DATA_DIR,n),JSON.stringify(d,null,2),'utf8')}
+const norm=s=>String(s||'').trim().replace(/\s+/g,' ');
+const validPin=p=>/^\d{4}$/.test(String(p||''));
+const validMobile=m=>/^\d{10}$/.test(String(m||''));
+function validFullName(v){const s=norm(v);if(!/^[\p{L} ]+$/u.test(s))return false;const p=s.split(' ');return p.length>=2&&p.every(x=>[...x].length>=2)}
+function studentPublic(x){return{id:x.id,name:x.name,fatherName:x.father_name??x.fatherName,mobile:x.mobile,pinSet:!!(x.pin_hash??x.pinHash)}}
+function clampInt(v,min,max,def){const n=parseInt(v,10);return Number.isFinite(n)?Math.max(min,Math.min(max,n)):def}
+function examPublic(x){return{id:Number(x.id),name:x.name,startAt:x.start_at??x.startAt??null,endAt:x.end_at??x.endAt??null,timerMode:x.timer_mode??x.timerMode??'none',durationMinutes:Number(x.duration_minutes??x.durationMinutes??0),perQuestionSeconds:Number(x.per_question_seconds??x.perQuestionSeconds??0),questionLimit:Number(x.question_limit??x.questionLimit??0),passingPercentage:Number(x.passing_percentage??x.passingPercentage??40),attemptLimit:Number(x.attempt_limit??x.attemptLimit??0),randomQuestions:!!(x.random_questions??x.randomQuestions),active:!!x.active}}
+async function verifyStudent(mobile,pin){mobile=norm(mobile);if(!validMobile(mobile)||!validPin(pin))return null;if(useDb){const q=await pool.query('SELECT id,name,father_name,mobile,pin_hash FROM students WHERE mobile=$1',[mobile]);if(!q.rowCount||!q.rows[0].pin_hash)return null;return await bcrypt.compare(String(pin),q.rows[0].pin_hash)?q.rows[0]:null}const x=readLocal('students.json').find(s=>String(s.mobile)===mobile);if(!x||!x.pinHash)return null;return await bcrypt.compare(String(pin),x.pinHash)?x:null}
+function nowStatus(e){const now=Date.now(),s=e.startAt?new Date(e.startAt).getTime():null,en=e.endAt?new Date(e.endAt).getTime():null;if(!e.active)return'inactive';if(s&&now<s)return'upcoming';if(en&&now>en)return'ended';return'available'}
+function randomToken(){return crypto.randomBytes(24).toString('hex')}
+
+async function initDb(){if(!useDb)return;await pool.query(`
+CREATE TABLE IF NOT EXISTS students(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,father_name TEXT NOT NULL,mobile TEXT UNIQUE NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW());
+ALTER TABLE students ADD COLUMN IF NOT EXISTS pin_hash TEXT;
+CREATE TABLE IF NOT EXISTS exams(
+ id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,start_at TIMESTAMPTZ,end_at TIMESTAMPTZ,
+ timer_mode TEXT NOT NULL DEFAULT 'none',duration_minutes INTEGER NOT NULL DEFAULT 0,
+ per_question_seconds INTEGER NOT NULL DEFAULT 0,question_limit INTEGER NOT NULL DEFAULT 0,
+ passing_percentage NUMERIC(5,2) NOT NULL DEFAULT 40,attempt_limit INTEGER NOT NULL DEFAULT 0,
+ random_questions BOOLEAN NOT NULL DEFAULT FALSE,active BOOLEAN NOT NULL DEFAULT TRUE,created_at TIMESTAMPTZ DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS questions(id BIGSERIAL PRIMARY KEY,question TEXT NOT NULL,option_a TEXT NOT NULL,option_b TEXT NOT NULL,option_c TEXT NOT NULL,option_d TEXT NOT NULL,answer CHAR(1) NOT NULL);
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS exam_id BIGINT;
+ALTER TABLE questions ADD COLUMN IF NOT EXISTS question_seconds INTEGER;
+CREATE INDEX IF NOT EXISTS idx_questions_exam ON questions(exam_id,id);
+CREATE TABLE IF NOT EXISTS results(id BIGSERIAL PRIMARY KEY,student_id BIGINT,name TEXT NOT NULL,father_name TEXT NOT NULL,mobile TEXT NOT NULL,score INTEGER NOT NULL,total INTEGER NOT NULL,percentage NUMERIC(6,2) NOT NULL,status TEXT NOT NULL,created_at TIMESTAMPTZ DEFAULT NOW());
+ALTER TABLE results ADD COLUMN IF NOT EXISTS review_json JSONB;
+ALTER TABLE results ADD COLUMN IF NOT EXISTS exam_id BIGINT;
+ALTER TABLE results ADD COLUMN IF NOT EXISTS exam_name TEXT;
+ALTER TABLE results DROP CONSTRAINT IF EXISTS results_mobile_key;
+CREATE INDEX IF NOT EXISTS idx_results_mobile_created ON results(mobile,created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_results_exam_created ON results(exam_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS exam_sessions(
+ id BIGSERIAL PRIMARY KEY,token TEXT UNIQUE NOT NULL,student_id BIGINT NOT NULL,exam_id BIGINT NOT NULL,
+ started_at TIMESTAMPTZ DEFAULT NOW(),expires_at TIMESTAMPTZ,question_ids JSONB NOT NULL,submitted_at TIMESTAMPTZ);
+CREATE INDEX IF NOT EXISTS idx_sessions_student_exam ON exam_sessions(student_id,exam_id,started_at DESC);
+CREATE TABLE IF NOT EXISTS pin_reset_requests(id BIGSERIAL PRIMARY KEY,student_id BIGINT,mobile TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'PENDING',requested_at TIMESTAMPTZ DEFAULT NOW(),resolved_at TIMESTAMPTZ);
+CREATE INDEX IF NOT EXISTS idx_pin_reset_status ON pin_reset_requests(status,requested_at DESC);
+`);
+const ex=await pool.query('SELECT id FROM exams ORDER BY id LIMIT 1');
+let legacyId;
+if(!ex.rowCount){legacyId=(await pool.query(`INSERT INTO exams(name,timer_mode,passing_percentage,attempt_limit,active) VALUES('Legacy / General Exam','none',40,0,true) RETURNING id`)).rows[0].id}else legacyId=ex.rows[0].id;
+await pool.query('UPDATE questions SET exam_id=$1 WHERE exam_id IS NULL',[legacyId]);
 }
 
-const DATA_DIR=path.join(__dirname,"data");
-fs.mkdirSync(DATA_DIR,{recursive:true});
-function readLocal(name,fallback=[]){try{return JSON.parse(fs.readFileSync(path.join(DATA_DIR,name),"utf8"))}catch{return fallback}}
-function writeLocal(name,data){fs.writeFileSync(path.join(DATA_DIR,name),JSON.stringify(data,null,2),"utf8")}
-const norm=s=>String(s||"").trim().replace(/\s+/g," ");
-const validPin=p=>/^\d{4}$/.test(String(p||""));
-const validMobile=m=>/^\d{10}$/.test(String(m||""));
-function validFullName(v){
-  const s=norm(v);
-  if(!/^[\p{L} ]+$/u.test(s)) return false;
-  const parts=s.split(" ");
-  return parts.length>=2 && parts.every(x=>[...x].length>=2);
-}
-function studentPublic(x){return {id:x.id,name:x.name,fatherName:x.father_name??x.fatherName,mobile:x.mobile,pinSet:!!(x.pin_hash??x.pinHash)}}
-async function verifyStudent(mobile,pin){
-  mobile=norm(mobile);
-  if(!validMobile(mobile)||!validPin(pin)) return null;
-  if(useDb){
-    const q=await pool.query(`SELECT id,name,father_name,mobile,pin_hash FROM students WHERE mobile=$1`,[mobile]);
-    if(!q.rowCount||!q.rows[0].pin_hash) return null;
-    return await bcrypt.compare(String(pin),q.rows[0].pin_hash)?q.rows[0]:null;
-  }
-  const x=readLocal("students.json").find(s=>String(s.mobile)===mobile);
-  if(!x||!x.pinHash) return null;
-  return await bcrypt.compare(String(pin),x.pinHash)?x:null;
-}
+app.use(cors());app.use(express.json({limit:'3mb'}));app.use(express.static(path.join(__dirname,'public')));
+app.get('/api/health',(req,res)=>res.json({ok:true,mode:useDb?'postgres':'local-json',version:'3.2'}));
 
-async function initDb(){
-  if(!useDb) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS students(
-      id BIGSERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      father_name TEXT NOT NULL,
-      mobile TEXT UNIQUE NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    ALTER TABLE students ADD COLUMN IF NOT EXISTS pin_hash TEXT;
+app.post('/api/register',async(req,res)=>{try{const b=req.body||{},name=norm(b.name),fatherName=norm(b.fatherName),mobile=norm(b.mobile),pin=String(b.pin||'');if(!validFullName(name))return res.status(400).json({error:'Enter full Student Name using letters only (at least 2 words).'});if(!validFullName(fatherName))return res.status(400).json({error:'Enter full Father Name using letters only (at least 2 words).'});if(!validMobile(mobile))return res.status(400).json({error:'Mobile Number must be exactly 10 digits.'});if(!validPin(pin))return res.status(400).json({error:'PIN must be exactly 4 digits.'});const pinHash=await bcrypt.hash(pin,10);if(useDb){const q=await pool.query('INSERT INTO students(name,father_name,mobile,pin_hash) VALUES($1,$2,$3,$4) ON CONFLICT(mobile) DO NOTHING RETURNING id,name,father_name,mobile,pin_hash',[name,fatherName,mobile,pinHash]);if(!q.rowCount)return res.status(409).json({error:'Mobile already registered. Please Login.'});return res.json({ok:true,student:studentPublic(q.rows[0])})}const s=readLocal('students.json');if(s.some(x=>String(x.mobile)===mobile))return res.status(409).json({error:'Mobile already registered. Please Login.'});const x={id:Date.now(),name,fatherName,mobile,pinHash,createdAt:new Date().toISOString()};s.push(x);writeLocal('students.json',s);res.json({ok:true,student:studentPublic(x)})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/login',async(req,res)=>{try{const mobile=norm(req.body?.mobile),pin=String(req.body?.pin||'');if(!validMobile(mobile)||!validPin(pin))return res.status(400).json({error:'Enter 10-digit Mobile Number and 4-digit PIN.'});const s=await verifyStudent(mobile,pin);if(!s)return res.status(401).json({error:'Mobile Number or PIN is incorrect.'});res.json({ok:true,student:studentPublic(s)})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/forgot-pin',async(req,res)=>{try{const mobile=norm(req.body?.mobile);if(!validMobile(mobile))return res.status(400).json({error:'Enter a valid 10-digit Mobile Number.'});if(useDb){const s=await pool.query('SELECT id FROM students WHERE mobile=$1',[mobile]);if(!s.rowCount)return res.status(404).json({error:'Mobile Number is not registered.'});const p=await pool.query("SELECT id FROM pin_reset_requests WHERE mobile=$1 AND status='PENDING' LIMIT 1",[mobile]);if(!p.rowCount)await pool.query('INSERT INTO pin_reset_requests(student_id,mobile) VALUES($1,$2)',[s.rows[0].id,mobile]);return res.json({ok:true,message:'PIN reset request sent to Admin.'})}const students=readLocal('students.json'),s=students.find(x=>String(x.mobile)===mobile);if(!s)return res.status(404).json({error:'Mobile Number is not registered.'});const rr=readLocal('pin_reset_requests.json');if(!rr.some(x=>x.mobile===mobile&&x.status==='PENDING'))rr.push({id:Date.now(),studentId:s.id,mobile,status:'PENDING',requestedAt:new Date().toISOString()});writeLocal('pin_reset_requests.json',rr);res.json({ok:true,message:'PIN reset request sent to Admin.'})}catch(e){res.status(500).json({error:e.message})}});
 
-    CREATE TABLE IF NOT EXISTS questions(
-      id BIGSERIAL PRIMARY KEY,
-      question TEXT NOT NULL,
-      option_a TEXT NOT NULL,
-      option_b TEXT NOT NULL,
-      option_c TEXT NOT NULL,
-      option_d TEXT NOT NULL,
-      answer CHAR(1) NOT NULL
-    );
+app.post('/api/exams/available',async(req,res)=>{try{const student=await verifyStudent(norm(req.body?.mobile),String(req.body?.pin||''));if(!student)return res.status(401).json({error:'Invalid login.'});if(!useDb)return res.json([]);const q=await pool.query(`SELECT e.*,(SELECT COUNT(*)::int FROM questions q WHERE q.exam_id=e.id) question_count,(SELECT COUNT(*)::int FROM results r WHERE r.exam_id=e.id AND r.student_id=$1) attempts_used FROM exams e ORDER BY COALESCE(e.start_at,e.created_at) DESC,e.id DESC`,[student.id]);res.json(q.rows.map(r=>{const e=examPublic(r);return{...e,status:nowStatus(e),questionCount:Number(r.question_count),attemptsUsed:Number(r.attempts_used),attemptsRemaining:e.attemptLimit===0?null:Math.max(0,e.attemptLimit-Number(r.attempts_used))}}))}catch(e){res.status(500).json({error:e.message})}});
 
-    CREATE TABLE IF NOT EXISTS results(
-      id BIGSERIAL PRIMARY KEY,
-      student_id BIGINT,
-      name TEXT NOT NULL,
-      father_name TEXT NOT NULL,
-      mobile TEXT NOT NULL,
-      score INTEGER NOT NULL,
-      total INTEGER NOT NULL,
-      percentage NUMERIC(6,2) NOT NULL,
-      status TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    ALTER TABLE results ADD COLUMN IF NOT EXISTS review_json JSONB;
-    ALTER TABLE results DROP CONSTRAINT IF EXISTS results_mobile_key;
-    CREATE INDEX IF NOT EXISTS idx_results_mobile_created ON results(mobile,created_at DESC);
+app.post('/api/exams/:id/start',async(req,res)=>{try{if(!useDb)return res.status(501).json({error:'V3.2 exam mode requires database.'});const student=await verifyStudent(norm(req.body?.mobile),String(req.body?.pin||''));if(!student)return res.status(401).json({error:'Invalid login.'});const id=String(req.params.id);if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid exam.'});const er=await pool.query('SELECT * FROM exams WHERE id=$1',[id]);if(!er.rowCount)return res.status(404).json({error:'Exam not found.'});const e=examPublic(er.rows[0]),st=nowStatus(e);if(st==='inactive')return res.status(403).json({error:'This exam is inactive.'});if(st==='upcoming')return res.status(403).json({error:'This exam has not started yet.'});if(st==='ended')return res.status(403).json({error:'This exam has ended.'});const used=Number((await pool.query('SELECT COUNT(*)::int c FROM results WHERE exam_id=$1 AND student_id=$2',[id,student.id])).rows[0].c);if(e.attemptLimit>0&&used>=e.attemptLimit)return res.status(403).json({error:'Your attempt limit for this exam is complete.'});let sql=`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,COALESCE(question_seconds,0) AS "questionSeconds" FROM questions WHERE exam_id=$1`;sql+=e.randomQuestions?' ORDER BY RANDOM()':' ORDER BY id';const params=[id];if(e.questionLimit>0){params.push(e.questionLimit);sql+=` LIMIT $${params.length}`}const qs=(await pool.query(sql,params)).rows;if(!qs.length)return res.status(400).json({error:'No questions uploaded for this exam.'});let expiresAt=null;const now=Date.now();if((e.timerMode==='whole'||e.timerMode==='both')&&e.durationMinutes>0)expiresAt=new Date(now+e.durationMinutes*60000);if(e.endAt){const end=new Date(e.endAt);if(!expiresAt||end<expiresAt)expiresAt=end}const token=randomToken();await pool.query('INSERT INTO exam_sessions(token,student_id,exam_id,expires_at,question_ids) VALUES($1,$2,$3,$4,$5::jsonb)',[token,student.id,id,expiresAt,JSON.stringify(qs.map(x=>Number(x.id)))]);res.json({sessionToken:token,exam:e,expiresAt:expiresAt?expiresAt.toISOString():null,questions:qs,attemptNumber:used+1})}catch(e){res.status(500).json({error:e.message})}});
 
-    CREATE TABLE IF NOT EXISTS pin_reset_requests(
-      id BIGSERIAL PRIMARY KEY,
-      student_id BIGINT,
-      mobile TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'PENDING',
-      requested_at TIMESTAMPTZ DEFAULT NOW(),
-      resolved_at TIMESTAMPTZ
-    );
-    CREATE INDEX IF NOT EXISTS idx_pin_reset_status ON pin_reset_requests(status,requested_at DESC);
-  `);
-}
+app.post('/api/result',async(req,res)=>{try{const b=req.body||{},mobile=norm(b.mobile),pin=String(b.pin||''),student=await verifyStudent(mobile,pin);if(!student)return res.status(401).json({error:'Student login verification failed.'});if(useDb&&b.sessionToken){const sr=await pool.query(`SELECT s.*,e.name,e.passing_percentage,e.timer_mode,e.per_question_seconds FROM exam_sessions s JOIN exams e ON e.id=s.exam_id WHERE s.token=$1 AND s.student_id=$2`,[String(b.sessionToken),student.id]);if(!sr.rowCount)return res.status(400).json({error:'Invalid exam session.'});const ses=sr.rows[0];if(ses.submitted_at)return res.status(409).json({error:'This exam attempt is already submitted.'});const ids=Array.isArray(ses.question_ids)?ses.question_ids:JSON.parse(ses.question_ids||'[]');const submitted=Array.isArray(b.answers)?b.answers.map(v=>Number.isInteger(Number(v))?Number(v):-1):[];if(submitted.length!==ids.length)return res.status(400).json({error:'Answer count does not match this exam.'});const qr=await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions WHERE id=ANY($1::bigint[])`,[ids]);const map=new Map(qr.rows.map(x=>[Number(x.id),x]));let score=0;const review=ids.map((qid,i)=>{const q=map.get(Number(qid));if(!q)return null;const si=submitted[i]>=0&&submitted[i]<=3?submitted[i]:-1,ci='ABCD'.indexOf(String(q.answer||'').toUpperCase());if(si===ci&&ci>=0)score++;return{question:q.question,a:q.a,b:q.b,c:q.c,d:q.d,selected:si>=0?'ABCD'[si]:'',correct:ci>=0?'ABCD'[ci]:'',isCorrect:si===ci&&ci>=0}}).filter(Boolean);const total=review.length,pct=total?+(score*100/total).toFixed(2):0,status=pct>=Number(ses.passing_percentage||40)?'PASS':'FAIL';const fatherName=student.father_name;const c=await pool.connect();try{await c.query('BEGIN');const r=await c.query(`INSERT INTO results(student_id,name,father_name,mobile,score,total,percentage,status,review_json,exam_id,exam_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11) RETURNING id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,review_json AS review,exam_id AS "examId",exam_name AS "examName",created_at AS "createdAt"`,[student.id,student.name,fatherName,mobile,score,total,pct,status,JSON.stringify(review),ses.exam_id,ses.name]);await c.query('UPDATE exam_sessions SET submitted_at=NOW() WHERE id=$1',[ses.id]);await c.query('COMMIT');return res.json(r.rows[0])}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}
+// Compatibility for old V3.1 APK
+let score=0,total=0,review=null;if(Array.isArray(b.answers)){const qs=useDb?(await pool.query('SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions ORDER BY id')).rows:readLocal('questions.json');const submitted=b.answers.map(v=>Number.isInteger(Number(v))?Number(v):-1);total=qs.length;review=qs.map((q,i)=>{const si=submitted[i]>=0&&submitted[i]<=3?submitted[i]:-1,ci='ABCD'.indexOf(String(q.answer||'').toUpperCase());if(si===ci&&ci>=0)score++;return{question:q.question,a:q.a,b:q.b,c:q.c,d:q.d,selected:si>=0?'ABCD'[si]:'',correct:ci>=0?'ABCD'[ci]:'',isCorrect:si===ci&&ci>=0}})}else{total=Math.max(0,Number(b.total)||0);score=Math.max(0,Number(b.score)||0)}const pct=total?+(score*100/total).toFixed(2):0,status=pct>=40?'PASS':'FAIL';if(useDb){const r=await pool.query(`INSERT INTO results(student_id,name,father_name,mobile,score,total,percentage,status,review_json,exam_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'Legacy App Attempt') RETURNING id,score,total,percentage,status,review_json AS review,exam_name AS "examName",created_at AS "createdAt"`,[student.id,student.name,student.father_name,mobile,score,total,pct,status,review?JSON.stringify(review):null]);return res.json(r.rows[0])}res.status(501).json({error:'Local V3.2 result mode not supported.'})}catch(e){res.status(500).json({error:e.message})}});
 
-app.use(cors());
-app.use(express.json({limit:"2mb"}));
-app.use(express.static(path.join(__dirname,"public")));
-app.get("/api/health",(req,res)=>res.json({ok:true,mode:useDb?"postgres":"local-json",version:"3.1"}));
+app.post('/api/my-results',async(req,res)=>{try{const student=await verifyStudent(norm(req.body?.mobile),String(req.body?.pin||''));if(!student)return res.status(401).json({error:'Invalid Mobile Number or PIN.'});if(useDb){const q=await pool.query(`SELECT id,score,total,percentage,status,review_json AS review,exam_id AS "examId",COALESCE(exam_name,'Old Exam') AS "examName",created_at AS "createdAt" FROM results WHERE mobile=$1 ORDER BY created_at DESC,id DESC`,[student.mobile]);return res.json({student:studentPublic(student),results:q.rows})}res.json({student:studentPublic(student),results:readLocal('results.json').filter(x=>String(x.mobile)===student.mobile)})}catch(e){res.status(500).json({error:e.message})}});
 
-app.post("/api/register",async(req,res)=>{
-  try{
-    const b=req.body||{}, name=norm(b.name), fatherName=norm(b.fatherName), mobile=norm(b.mobile), pin=String(b.pin||"");
-    if(!validFullName(name)) return res.status(400).json({error:"Enter full Student Name using letters only (at least 2 words)."});
-    if(!validFullName(fatherName)) return res.status(400).json({error:"Enter full Father Name using letters only (at least 2 words)."});
-    if(!validMobile(mobile)) return res.status(400).json({error:"Mobile Number must be exactly 10 digits."});
-    if(!validPin(pin)) return res.status(400).json({error:"PIN must be exactly 4 digits."});
-    const pinHash=await bcrypt.hash(pin,10);
-    if(useDb){
-      const q=await pool.query(`INSERT INTO students(name,father_name,mobile,pin_hash) VALUES($1,$2,$3,$4) ON CONFLICT(mobile) DO NOTHING RETURNING id,name,father_name,mobile,pin_hash`,[name,fatherName,mobile,pinHash]);
-      if(!q.rowCount) return res.status(409).json({error:"Mobile already registered. Please Login."});
-      return res.json({ok:true,student:studentPublic(q.rows[0])});
-    }
-    const s=readLocal("students.json");
-    if(s.some(x=>String(x.mobile)===mobile)) return res.status(409).json({error:"Mobile already registered. Please Login."});
-    const x={id:Date.now(),name,fatherName,mobile,pinHash,createdAt:new Date().toISOString()};
-    s.push(x);writeLocal("students.json",s);return res.json({ok:true,student:studentPublic(x)});
-  }catch(e){res.status(500).json({error:e.message})}
-});
+// Compatibility endpoint for V3.1 APK while V3.2 is being installed.
+app.get('/api/questions',async(req,res)=>{try{if(!useDb)return res.json(readLocal('questions.json'));const ex=await pool.query(`SELECT id FROM exams WHERE active=true ORDER BY id LIMIT 1`);if(!ex.rowCount)return res.json([]);const q=await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions WHERE exam_id=$1 ORDER BY id`,[ex.rows[0].id]);res.json(q.rows)}catch(e){res.status(500).json({error:e.message})}});
 
-app.post("/api/login",async(req,res)=>{
-  try{
-    const mobile=norm(req.body?.mobile), pin=String(req.body?.pin||"");
-    if(!validMobile(mobile)||!validPin(pin)) return res.status(400).json({error:"Enter 10-digit Mobile Number and 4-digit PIN."});
-    if(useDb){
-      const q=await pool.query(`SELECT id,name,father_name,mobile,pin_hash FROM students WHERE mobile=$1`,[mobile]);
-      if(!q.rowCount) return res.status(404).json({error:"Mobile Number is not registered."});
-      if(!q.rows[0].pin_hash) return res.status(409).json({error:"PIN is not set for this old account. Use Forgot PIN and ask Admin to set a PIN."});
-      if(!(await bcrypt.compare(pin,q.rows[0].pin_hash))) return res.status(401).json({error:"Incorrect PIN."});
-      return res.json({ok:true,student:studentPublic(q.rows[0])});
-    }
-    const x=readLocal("students.json").find(s=>String(s.mobile)===mobile);
-    if(!x) return res.status(404).json({error:"Mobile Number is not registered."});
-    if(!x.pinHash) return res.status(409).json({error:"PIN is not set for this old account. Use Forgot PIN."});
-    if(!(await bcrypt.compare(pin,x.pinHash))) return res.status(401).json({error:"Incorrect PIN."});
-    res.json({ok:true,student:studentPublic(x)});
-  }catch(e){res.status(500).json({error:e.message})}
-});
+// Admin exams
+app.get('/api/admin/exams',async(req,res)=>{try{if(!useDb)return res.json(readLocal('exams.json'));const q=await pool.query(`SELECT e.*,(SELECT COUNT(*)::int FROM questions q WHERE q.exam_id=e.id) question_count,(SELECT COUNT(*)::int FROM results r WHERE r.exam_id=e.id) result_count FROM exams e ORDER BY e.created_at DESC,e.id DESC`);res.json(q.rows.map(r=>({...examPublic(r),questionCount:Number(r.question_count),resultCount:Number(r.result_count),status:nowStatus(examPublic(r))})))}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/admin/exams',async(req,res)=>{try{if(!useDb)return res.status(501).json({error:'Database required.'});const b=req.body||{},name=norm(b.name),timerMode=String(b.timerMode||'none');if(!name)return res.status(400).json({error:'Exam Name is required.'});if(!['none','whole','per_question','both'].includes(timerMode))return res.status(400).json({error:'Invalid timer mode.'});const duration=clampInt(b.durationMinutes,0,1440,0),per=clampInt(b.perQuestionSeconds,0,3600,0),ql=clampInt(b.questionLimit,0,1000,0),pass=Math.max(0,Math.min(100,Number(b.passingPercentage)||40)),attempt=clampInt(b.attemptLimit,0,100,0);if((timerMode==='whole'||timerMode==='both')&&duration<1)return res.status(400).json({error:'Whole paper timer needs Duration Minutes.'});if((timerMode==='per_question'||timerMode==='both')&&per<1)return res.status(400).json({error:'Per Question timer needs seconds.'});const start=b.startAt?new Date(b.startAt):null,end=b.endAt?new Date(b.endAt):null;if(start&&isNaN(start))return res.status(400).json({error:'Invalid start date/time.'});if(end&&isNaN(end))return res.status(400).json({error:'Invalid end date/time.'});if(start&&end&&end<=start)return res.status(400).json({error:'End time must be after Start time.'});const q=await pool.query(`INSERT INTO exams(name,start_at,end_at,timer_mode,duration_minutes,per_question_seconds,question_limit,passing_percentage,attempt_limit,random_questions,active) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[name,start,end,timerMode,duration,per,ql,pass,attempt,!!b.randomQuestions,b.active!==false]);res.json(examPublic(q.rows[0]))}catch(e){res.status(500).json({error:e.message})}});
+app.put('/api/admin/exams/:id',async(req,res)=>{try{if(!useDb)return res.status(501).json({error:'Database required.'});const id=req.params.id,b=req.body||{},name=norm(b.name),timerMode=String(b.timerMode||'none');if(!/^\d+$/.test(id)||!name)return res.status(400).json({error:'Invalid exam data.'});const duration=clampInt(b.durationMinutes,0,1440,0),per=clampInt(b.perQuestionSeconds,0,3600,0),ql=clampInt(b.questionLimit,0,1000,0),pass=Math.max(0,Math.min(100,Number(b.passingPercentage)||40)),attempt=clampInt(b.attemptLimit,0,100,0);if((timerMode==='whole'||timerMode==='both')&&duration<1)return res.status(400).json({error:'Duration Minutes required.'});if((timerMode==='per_question'||timerMode==='both')&&per<1)return res.status(400).json({error:'Per Question Seconds required.'});const start=b.startAt?new Date(b.startAt):null,end=b.endAt?new Date(b.endAt):null;const q=await pool.query(`UPDATE exams SET name=$1,start_at=$2,end_at=$3,timer_mode=$4,duration_minutes=$5,per_question_seconds=$6,question_limit=$7,passing_percentage=$8,attempt_limit=$9,random_questions=$10,active=$11 WHERE id=$12 RETURNING *`,[name,start,end,timerMode,duration,per,ql,pass,attempt,!!b.randomQuestions,b.active!==false,id]);if(!q.rowCount)return res.status(404).json({error:'Exam not found.'});res.json(examPublic(q.rows[0]))}catch(e){res.status(500).json({error:e.message})}});
+app.delete('/api/admin/exams/:id',async(req,res)=>{try{if(!useDb)return res.status(501).json({error:'Database required.'});const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid exam id.'});const counts=await pool.query('SELECT (SELECT COUNT(*) FROM results WHERE exam_id=$1) results,(SELECT COUNT(*) FROM questions WHERE exam_id=$1) questions',[id]);if(Number(counts.rows[0].results)>0)return res.status(409).json({error:'This exam has results. Delete its results first or set exam Inactive.'});await pool.query('DELETE FROM exam_sessions WHERE exam_id=$1',[id]);await pool.query('DELETE FROM questions WHERE exam_id=$1',[id]);const q=await pool.query('DELETE FROM exams WHERE id=$1 RETURNING id',[id]);if(!q.rowCount)return res.status(404).json({error:'Exam not found.'});res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
 
-app.post("/api/forgot-pin",async(req,res)=>{
-  try{
-    const mobile=norm(req.body?.mobile);
-    if(!validMobile(mobile)) return res.status(400).json({error:"Enter a valid 10-digit Mobile Number."});
-    if(useDb){
-      const s=await pool.query(`SELECT id,name,father_name,mobile FROM students WHERE mobile=$1`,[mobile]);
-      if(!s.rowCount) return res.status(404).json({error:"Mobile Number is not registered."});
-      const pending=await pool.query(`SELECT id FROM pin_reset_requests WHERE mobile=$1 AND status='PENDING' LIMIT 1`,[mobile]);
-      if(!pending.rowCount) await pool.query(`INSERT INTO pin_reset_requests(student_id,mobile) VALUES($1,$2)`,[s.rows[0].id,mobile]);
-      return res.json({ok:true,message:"PIN reset request sent to Admin."});
-    }
-    const students=readLocal("students.json"), s=students.find(x=>String(x.mobile)===mobile);
-    if(!s) return res.status(404).json({error:"Mobile Number is not registered."});
-    const rr=readLocal("pin_reset_requests.json");
-    if(!rr.some(x=>x.mobile===mobile&&x.status==="PENDING")) rr.push({id:Date.now(),studentId:s.id,mobile,status:"PENDING",requestedAt:new Date().toISOString()});
-    writeLocal("pin_reset_requests.json",rr);res.json({ok:true,message:"PIN reset request sent to Admin."});
-  }catch(e){res.status(500).json({error:e.message})}
-});
+app.get('/api/admin/questions',async(req,res)=>{try{if(!useDb)return res.json(readLocal('questions.json'));const examId=norm(req.query.examId);if(!/^\d+$/.test(examId))return res.status(400).json({error:'Select exam.'});const q=await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer,COALESCE(question_seconds,0) AS "questionSeconds" FROM questions WHERE exam_id=$1 ORDER BY id`,[examId]);res.json(q.rows)}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/admin/upload-excel',upload.single('file'),async(req,res)=>{if(!req.file)return res.status(400).json({error:'Select Excel'});try{if(!useDb)throw new Error('Database required for V3.2');const examId=norm(req.body?.examId);if(!/^\d+$/.test(examId))throw new Error('Select Exam before upload');const ex=await pool.query('SELECT id FROM exams WHERE id=$1',[examId]);if(!ex.rowCount)throw new Error('Exam not found');const wb=XLSX.readFile(req.file.path),ws=wb.Sheets[wb.SheetNames[0]],rows=XLSX.utils.sheet_to_json(ws,{defval:''}),errors=[],valid=[];rows.forEach((z,i)=>{const n=i+2,question=norm(z.Question),a=norm(z['Option A']),b=norm(z['Option B']),c=norm(z['Option C']),d=norm(z['Option D']),raw=norm(z.Answer).toUpperCase(),answer=({'1':'A','2':'B','3':'C','4':'D'}[raw]||raw),qsec=clampInt(z['Time Seconds']||z['Question Seconds'],0,3600,0);if(!question)errors.push(`Row ${n}: Question missing`);if(!a)errors.push(`Row ${n}: Option A missing`);if(!b)errors.push(`Row ${n}: Option B missing`);if(!c)errors.push(`Row ${n}: Option C missing`);if(!d)errors.push(`Row ${n}: Option D missing`);if(!['A','B','C','D'].includes(answer))errors.push(`Row ${n}: Answer must be A/B/C/D or 1/2/3/4`);if(question&&a&&b&&c&&d&&['A','B','C','D'].includes(answer))valid.push({question,a,b,c,d,answer,qsec})});for(const x of valid)await pool.query('INSERT INTO questions(exam_id,question,option_a,option_b,option_c,option_d,answer,question_seconds) VALUES($1,$2,$3,$4,$5,$6,$7,$8)',[examId,x.question,x.a,x.b,x.c,x.d,x.answer,x.qsec||null]);fs.unlinkSync(req.file.path);res.json({found:rows.length,imported:valid.length,errors})}catch(e){try{fs.unlinkSync(req.file.path)}catch{}res.status(400).json({error:e.message})}});
+app.post('/api/admin/clear-questions',async(req,res)=>{try{const id=norm(req.body?.examId);if(!/^\d+$/.test(id))return res.status(400).json({error:'Select exam.'});if(useDb)await pool.query('DELETE FROM questions WHERE exam_id=$1',[id]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
 
-app.get("/api/questions",async(req,res)=>{
-  try{
-    if(useDb){const q=await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions ORDER BY id`);return res.json(q.rows)}
-    res.json(readLocal("questions.json"));
-  }catch(e){res.status(500).json({error:e.message})}
-});
+app.get('/api/results',async(req,res)=>{try{if(!useDb)return res.json(readLocal('results.json'));const from=norm(req.query.from),to=norm(req.query.to),examId=norm(req.query.examId),validDate=x=>/^\d{4}-\d{2}-\d{2}$/.test(x);if((from&&!validDate(from))||(to&&!validDate(to)))return res.status(400).json({error:'Date must be YYYY-MM-DD'});let sql=`SELECT id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,exam_id AS "examId",COALESCE(exam_name,'Old Exam') AS "examName",created_at AS "createdAt" FROM results`,params=[],w=[];if(from){params.push(from);w.push(`created_at >= ($${params.length}::date AT TIME ZONE 'Asia/Kolkata')`)}if(to){params.push(to);w.push(`created_at < (($${params.length}::date + 1) AT TIME ZONE 'Asia/Kolkata')`)}if(examId){if(!/^\d+$/.test(examId))return res.status(400).json({error:'Invalid exam.'});params.push(examId);w.push(`exam_id=$${params.length}`)}if(w.length)sql+=' WHERE '+w.join(' AND ');sql+=' ORDER BY created_at DESC,id DESC';res.json((await pool.query(sql,params)).rows)}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/admin/students',async(req,res)=>{try{if(useDb){const q=await pool.query(`SELECT id,name,father_name AS "fatherName",mobile,(pin_hash IS NOT NULL) AS "pinSet",created_at AS "createdAt" FROM students ORDER BY created_at DESC,id DESC`);return res.json(q.rows)}res.json(readLocal('students.json').map(x=>({id:x.id,name:x.name,fatherName:x.fatherName,mobile:x.mobile,pinSet:!!x.pinHash,createdAt:x.createdAt})))}catch(e){res.status(500).json({error:e.message})}});
+app.get('/api/admin/pin-reset-requests',async(req,res)=>{try{if(useDb){const q=await pool.query(`SELECT r.id,r.student_id AS "studentId",r.mobile,r.status,r.requested_at AS "requestedAt",r.resolved_at AS "resolvedAt",s.name,s.father_name AS "fatherName" FROM pin_reset_requests r LEFT JOIN students s ON s.id=r.student_id ORDER BY CASE WHEN r.status='PENDING' THEN 0 ELSE 1 END,r.requested_at DESC`);return res.json(q.rows)}res.json([])}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/admin/reset-pin',async(req,res)=>{try{const requestId=req.body?.requestId,studentId=req.body?.studentId,mobile=norm(req.body?.mobile),newPin=String(req.body?.newPin||'');if(!validPin(newPin))return res.status(400).json({error:'New PIN must be exactly 4 digits.'});const hash=await bcrypt.hash(newPin,10);if(useDb){let q;if(studentId)q=await pool.query('UPDATE students SET pin_hash=$1 WHERE id=$2 RETURNING id,mobile',[hash,studentId]);else q=await pool.query('UPDATE students SET pin_hash=$1 WHERE mobile=$2 RETURNING id,mobile',[hash,mobile]);if(!q.rowCount)return res.status(404).json({error:'Student not found.'});if(requestId)await pool.query("UPDATE pin_reset_requests SET status='RESOLVED',resolved_at=NOW() WHERE id=$1",[requestId]);else await pool.query("UPDATE pin_reset_requests SET status='RESOLVED',resolved_at=NOW() WHERE mobile=$1 AND status='PENDING'",[q.rows[0].mobile]);return res.json({ok:true,message:'PIN has been set/reset successfully.'})}res.status(501).json({error:'Database required.'})}catch(e){res.status(500).json({error:e.message})}});
+app.delete('/api/admin/results/:id',async(req,res)=>{try{const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid result id.'});if(useDb){const q=await pool.query('DELETE FROM results WHERE id=$1 RETURNING id',[id]);if(!q.rowCount)return res.status(404).json({error:'Result not found.'});return res.json({ok:true,message:'Result deleted.'})}res.status(501).json({error:'Database required.'})}catch(e){res.status(500).json({error:e.message})}});
+app.delete('/api/admin/students/:id',async(req,res)=>{try{const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid student id.'});if(!useDb)return res.status(501).json({error:'Database required.'});const c=await pool.connect();try{await c.query('BEGIN');const st=await c.query('SELECT mobile FROM students WHERE id=$1',[id]);if(!st.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Student not found.'})}const mobile=st.rows[0].mobile;await c.query('DELETE FROM exam_sessions WHERE student_id=$1',[id]);await c.query('DELETE FROM pin_reset_requests WHERE student_id=$1 OR mobile=$2',[id,mobile]);await c.query('DELETE FROM results WHERE student_id=$1 OR mobile=$2',[id,mobile]);await c.query('DELETE FROM students WHERE id=$1',[id]);await c.query('COMMIT');res.json({ok:true,message:'Student and linked data deleted.'})}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}catch(e){res.status(500).json({error:e.message})}});
 
-app.post("/api/result",async(req,res)=>{
-  try{
-    const b=req.body||{}, mobile=norm(b.mobile), pin=String(b.pin||"");
-    let student=null;
-    if(pin) student=await verifyStudent(mobile,pin);
-    else {
-      // Compatibility only for old accounts that do not yet have a PIN.
-      if(useDb){const q=await pool.query(`SELECT id,name,father_name,mobile,pin_hash FROM students WHERE mobile=$1`,[mobile]);if(q.rowCount&&!q.rows[0].pin_hash)student=q.rows[0]}
-      else {const x=readLocal("students.json").find(s=>String(s.mobile)===mobile);if(x&&!x.pinHash)student=x}
-    }
-    if(!student) return res.status(401).json({error:"Student login verification failed."});
-
-    let score=0,total=0,review=null;
-    if(Array.isArray(b.answers)){
-      const submitted=b.answers.map(v=>Number.isInteger(Number(v))?Number(v):-1);
-      let questions;
-      if(useDb){questions=(await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions ORDER BY id`)).rows}
-      else questions=readLocal("questions.json");
-      total=questions.length;
-      review=questions.map((q,i)=>{
-        const selectedIndex=(submitted[i]>=0&&submitted[i]<=3)?submitted[i]:-1;
-        const correctIndex="ABCD".indexOf(String(q.answer||"").toUpperCase());
-        if(selectedIndex===correctIndex && correctIndex>=0)score++;
-        return {question:q.question,a:q.a,b:q.b,c:q.c,d:q.d,selected:selectedIndex>=0?"ABCD"[selectedIndex]:"",correct:correctIndex>=0?"ABCD"[correctIndex]:"",isCorrect:selectedIndex===correctIndex&&correctIndex>=0};
-      });
-    }else{
-      // Backward compatibility with older APK versions.
-      total=Math.max(0,Number(b.total)||0);score=Math.max(0,Number(b.score)||0);
-      if(score>total) return res.status(400).json({error:"Invalid score."});
-    }
-    const percentage=total?+(score*100/total).toFixed(2):0, status=total&&score/total>=0.4?"PASS":"FAIL";
-    const studentId=student.id, name=student.name, fatherName=student.father_name??student.fatherName;
-    if(useDb){
-      const q=await pool.query(`INSERT INTO results(student_id,name,father_name,mobile,score,total,percentage,status,review_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,review_json AS review,created_at AS "createdAt"`,[studentId,name,fatherName,mobile,score,total,percentage,status,review?JSON.stringify(review):null]);
-      return res.json(q.rows[0]);
-    }
-    const rows=readLocal("results.json"),x={id:Date.now(),studentId,name,fatherName,mobile,score,total,percentage,status,review,createdAt:new Date().toISOString()};rows.push(x);writeLocal("results.json",rows);res.json(x);
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.post("/api/my-results",async(req,res)=>{
-  try{
-    const mobile=norm(req.body?.mobile),pin=String(req.body?.pin||"");
-    const student=await verifyStudent(mobile,pin);
-    if(!student) return res.status(401).json({error:"Invalid Mobile Number or PIN."});
-    if(useDb){const q=await pool.query(`SELECT id,score,total,percentage,status,review_json AS review,created_at AS "createdAt" FROM results WHERE mobile=$1 ORDER BY created_at DESC,id DESC`,[mobile]);return res.json({student:studentPublic(student),results:q.rows})}
-    const rows=readLocal("results.json").filter(x=>String(x.mobile)===mobile).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));res.json({student:studentPublic(student),results:rows});
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.get("/api/results",async(req,res)=>{
-  try{
-    const from=norm(req.query.from),to=norm(req.query.to),validDate=x=>/^\d{4}-\d{2}-\d{2}$/.test(x);
-    if((from&&!validDate(from))||(to&&!validDate(to))) return res.status(400).json({error:"Date must be YYYY-MM-DD"});
-    if(useDb){
-      let sql=`SELECT id,student_id AS "studentId",name,father_name AS "fatherName",mobile,score,total,percentage,status,created_at AS "createdAt" FROM results`;const params=[],where=[];
-      if(from){params.push(from);where.push(`created_at >= ($${params.length}::date AT TIME ZONE 'Asia/Kolkata')`)}
-      if(to){params.push(to);where.push(`created_at < (($${params.length}::date + 1) AT TIME ZONE 'Asia/Kolkata')`)}
-      if(where.length)sql+=' WHERE '+where.join(' AND ');sql+=' ORDER BY created_at DESC,id DESC';return res.json((await pool.query(sql,params)).rows);
-    }
-    let rows=readLocal("results.json");if(from||to){const start=from?new Date(from+'T00:00:00+05:30'):null,end=to?new Date(to+'T23:59:59.999+05:30'):null;rows=rows.filter(x=>{const d=new Date(x.createdAt||0);return(!start||d>=start)&&(!end||d<=end)})}res.json(rows.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)));
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.get("/api/admin/students",async(req,res)=>{
-  try{
-    if(useDb){const q=await pool.query(`SELECT id,name,father_name AS "fatherName",mobile,(pin_hash IS NOT NULL) AS "pinSet",created_at AS "createdAt" FROM students ORDER BY created_at DESC,id DESC`);return res.json(q.rows)}
-    res.json(readLocal("students.json").map(x=>({id:x.id,name:x.name,fatherName:x.fatherName,mobile:x.mobile,pinSet:!!x.pinHash,createdAt:x.createdAt})));
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.get("/api/admin/pin-reset-requests",async(req,res)=>{
-  try{
-    if(useDb){const q=await pool.query(`SELECT r.id,r.student_id AS "studentId",r.mobile,r.status,r.requested_at AS "requestedAt",r.resolved_at AS "resolvedAt",s.name,s.father_name AS "fatherName" FROM pin_reset_requests r LEFT JOIN students s ON s.id=r.student_id ORDER BY CASE WHEN r.status='PENDING' THEN 0 ELSE 1 END,r.requested_at DESC`);return res.json(q.rows)}
-    const students=readLocal("students.json");res.json(readLocal("pin_reset_requests.json").map(r=>{const s=students.find(x=>String(x.id)===String(r.studentId))||{};return {...r,name:s.name||'',fatherName:s.fatherName||''}}));
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.post("/api/admin/reset-pin",async(req,res)=>{
-  try{
-    const requestId=req.body?.requestId, studentId=req.body?.studentId, mobile=norm(req.body?.mobile),newPin=String(req.body?.newPin||"");
-    if(!validPin(newPin)) return res.status(400).json({error:"New PIN must be exactly 4 digits."});
-    const hash=await bcrypt.hash(newPin,10);
-    if(useDb){
-      let q;if(studentId)q=await pool.query(`UPDATE students SET pin_hash=$1 WHERE id=$2 RETURNING id,mobile`,[hash,studentId]);else q=await pool.query(`UPDATE students SET pin_hash=$1 WHERE mobile=$2 RETURNING id,mobile`,[hash,mobile]);
-      if(!q.rowCount)return res.status(404).json({error:"Student not found."});
-      if(requestId)await pool.query(`UPDATE pin_reset_requests SET status='RESOLVED',resolved_at=NOW() WHERE id=$1`,[requestId]);
-      else await pool.query(`UPDATE pin_reset_requests SET status='RESOLVED',resolved_at=NOW() WHERE mobile=$1 AND status='PENDING'`,[q.rows[0].mobile]);
-      return res.json({ok:true,message:"PIN has been set/reset successfully."});
-    }
-    const students=readLocal("students.json");const s=students.find(x=>studentId?String(x.id)===String(studentId):String(x.mobile)===mobile);if(!s)return res.status(404).json({error:"Student not found."});s.pinHash=hash;writeLocal("students.json",students);const rr=readLocal("pin_reset_requests.json");rr.forEach(r=>{if((requestId&&String(r.id)===String(requestId))||(!requestId&&r.mobile===s.mobile&&r.status==='PENDING')){r.status='RESOLVED';r.resolvedAt=new Date().toISOString()}});writeLocal("pin_reset_requests.json",rr);res.json({ok:true,message:"PIN has been set/reset successfully."});
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.delete("/api/admin/results/:id",async(req,res)=>{
-  try{
-    const id=String(req.params.id||"");
-    if(!/^\d+$/.test(id))return res.status(400).json({error:"Invalid result id."});
-    if(useDb){const q=await pool.query(`DELETE FROM results WHERE id=$1 RETURNING id`,[id]);if(!q.rowCount)return res.status(404).json({error:"Result not found."});return res.json({ok:true,message:"Result deleted."})}
-    const rows=readLocal("results.json"),next=rows.filter(x=>String(x.id)!==id);if(next.length===rows.length)return res.status(404).json({error:"Result not found."});writeLocal("results.json",next);res.json({ok:true,message:"Result deleted."});
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.delete("/api/admin/students/:id",async(req,res)=>{
-  try{
-    const id=String(req.params.id||"");
-    if(!/^\d+$/.test(id))return res.status(400).json({error:"Invalid student id."});
-    if(useDb){
-      const c=await pool.connect();try{await c.query('BEGIN');const st=await c.query(`SELECT mobile FROM students WHERE id=$1`,[id]);if(!st.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:"Student not found."})}const mobile=st.rows[0].mobile;await c.query(`DELETE FROM pin_reset_requests WHERE student_id=$1 OR mobile=$2`,[id,mobile]);await c.query(`DELETE FROM results WHERE student_id=$1 OR mobile=$2`,[id,mobile]);await c.query(`DELETE FROM students WHERE id=$1`,[id]);await c.query('COMMIT');return res.json({ok:true,message:"Student and all linked results/reset requests deleted."});}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}
-    }
-    const students=readLocal("students.json"),st=students.find(x=>String(x.id)===id);if(!st)return res.status(404).json({error:"Student not found."});writeLocal("students.json",students.filter(x=>String(x.id)!==id));writeLocal("results.json",readLocal("results.json").filter(x=>String(x.studentId)!==id&&String(x.mobile)!==String(st.mobile)));writeLocal("pin_reset_requests.json",readLocal("pin_reset_requests.json").filter(x=>String(x.studentId)!==id&&String(x.mobile)!==String(st.mobile)));res.json({ok:true,message:"Student and linked data deleted."});
-  }catch(e){res.status(500).json({error:e.message})}
-});
-
-app.post("/api/admin/upload-excel",upload.single("file"),async(req,res)=>{
-  if(!req.file)return res.status(400).json({error:"Select Excel"});
-  try{
-    const wb=XLSX.readFile(req.file.path),ws=wb.Sheets[wb.SheetNames[0]],rows=XLSX.utils.sheet_to_json(ws,{defval:""}),errors=[],valid=[];
-    rows.forEach((z,i)=>{const n=i+2,question=norm(z.Question),a=norm(z["Option A"]),b=norm(z["Option B"]),c=norm(z["Option C"]),d=norm(z["Option D"]),raw=norm(z.Answer).toUpperCase(),answer=({"1":"A","2":"B","3":"C","4":"D"}[raw]||raw);if(!question)errors.push(`Row ${n}: Question missing`);if(!a)errors.push(`Row ${n}: Option A missing`);if(!b)errors.push(`Row ${n}: Option B missing`);if(!c)errors.push(`Row ${n}: Option C missing`);if(!d)errors.push(`Row ${n}: Option D missing`);if(!["A","B","C","D"].includes(answer))errors.push(`Row ${n}: Answer must be A/B/C/D or 1/2/3/4`);if(question&&a&&b&&c&&d&&["A","B","C","D"].includes(answer))valid.push({question,a,b,c,d,answer})});
-    if(useDb){for(const x of valid)await pool.query(`INSERT INTO questions(question,option_a,option_b,option_c,option_d,answer) VALUES($1,$2,$3,$4,$5,$6)`,[x.question,x.a,x.b,x.c,x.d,x.answer])}else{const qs=readLocal("questions.json");valid.forEach((x,i)=>qs.push({id:Date.now()+i,...x}));writeLocal("questions.json",qs)}
-    fs.unlinkSync(req.file.path);res.json({found:rows.length,imported:valid.length,errors});
-  }catch(e){try{fs.unlinkSync(req.file.path)}catch{}res.status(400).json({error:e.message})}
-});
-app.post("/api/admin/clear-questions",async(req,res)=>{try{if(useDb)await pool.query(`DELETE FROM questions`);else writeLocal("questions.json",[]);res.json({ok:true})}catch(e){res.status(500).json({error:e.message})}});
-// Kept only so older admin pages do not error. Multiple attempts are now intentional.
-app.post("/api/admin/remove-duplicate-results",async(req,res)=>res.json({before:0,after:0,removed:0,message:"V3.0 allows multiple exam attempts. No results were removed."}));
-
-initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?"Postgres":"local JSON"}) - V3.1`))).catch(err=>{console.error("Database startup error:",err);process.exit(1)});
+initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?'Postgres':'local JSON'}) - V3.2`))).catch(err=>{console.error('Database startup error:',err);process.exit(1)});
