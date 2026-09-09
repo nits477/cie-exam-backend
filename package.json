@@ -1,6 +1,6 @@
 {
-  "name": "cie-exam-v3-3-public-portal-admin-auth",
-  "version": "3.3.0",
+  "name": "cie-exam-v3-4-app-management-thumbnails",
+  "version": "3.4.0",
   "private": true,
   "scripts": {
     "start": "node server.js"
