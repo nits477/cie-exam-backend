@@ -162,6 +162,31 @@ app.post('/api/result',async(req,res)=>{try{const b=req.body||{},mobile=norm(b.m
 let score=0,total=0,review=null;if(Array.isArray(b.answers)){const qs=useDb?(await pool.query('SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions ORDER BY id')).rows:readLocal('questions.json');const submitted=b.answers.map(v=>Number.isInteger(Number(v))?Number(v):-1);total=qs.length;review=qs.map((q,i)=>{const si=submitted[i]>=0&&submitted[i]<=3?submitted[i]:-1,ci='ABCD'.indexOf(String(q.answer||'').toUpperCase());if(si===ci&&ci>=0)score++;return{question:q.question,a:q.a,b:q.b,c:q.c,d:q.d,selected:si>=0?'ABCD'[si]:'',correct:ci>=0?'ABCD'[ci]:'',isCorrect:si===ci&&ci>=0}})}else{total=Math.max(0,Number(b.total)||0);score=Math.max(0,Number(b.score)||0)}const pct=total?+(score*100/total).toFixed(2):0,status=pct>=40?'PASS':'FAIL';if(useDb){const r=await pool.query(`INSERT INTO results(student_id,name,father_name,mobile,score,total,percentage,status,review_json,exam_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,'Legacy App Attempt') RETURNING id,score,total,percentage,status,review_json AS review,exam_name AS "examName",created_at AS "createdAt"`,[student.id,student.name,student.father_name,mobile,score,total,pct,status,review?JSON.stringify(review):null]);return res.json(r.rows[0])}res.status(501).json({error:'Local V3.2 result mode not supported.'})}catch(e){res.status(500).json({error:e.message})}});
 
 app.post('/api/my-results',async(req,res)=>{try{const student=await verifyStudent(norm(req.body?.mobile),String(req.body?.pin||''));if(!student)return res.status(401).json({error:'Invalid Mobile Number or PIN.'});if(useDb){const q=await pool.query(`SELECT id,score,total,percentage,status,review_json AS review,exam_id AS "examId",COALESCE(exam_name,'Old Exam') AS "examName",created_at AS "createdAt" FROM results WHERE mobile=$1 ORDER BY created_at DESC,id DESC`,[student.mobile]);return res.json({student:studentPublic(student),results:q.rows})}res.json({student:studentPublic(student),results:readLocal('results.json').filter(x=>String(x.mobile)===student.mobile)})}catch(e){res.status(500).json({error:e.message})}});
+app.post('/api/leaderboard',async(req,res)=>{try{
+ const student=await verifyStudent(norm(req.body?.mobile),String(req.body?.pin||''));
+ if(!student)return res.status(401).json({error:'Invalid Mobile Number or PIN.'});
+ if(!useDb)return res.json({leaderboard:[],myRank:null});
+ const q=await pool.query(`WITH best AS (
+   SELECT DISTINCT ON (student_id) student_id,name,mobile,percentage,score,total,COALESCE(exam_name,'Exam') AS exam_name,created_at
+   FROM results WHERE student_id IS NOT NULL
+   ORDER BY student_id,percentage DESC,score DESC,created_at ASC
+ ), ranked AS (
+   SELECT ROW_NUMBER() OVER (ORDER BY percentage DESC,score DESC,created_at ASC)::int AS rank,
+          student_id,name,mobile,percentage,score,total,exam_name,created_at
+   FROM best
+ )
+ SELECT rank,student_id AS "studentId",name,percentage,score,total,exam_name AS "examName",
+        (mobile=$1) AS "isMe" FROM ranked ORDER BY rank LIMIT 20`,[student.mobile]);
+ const mr=await pool.query(`WITH best AS (
+   SELECT DISTINCT ON (student_id) student_id,mobile,percentage,score,created_at
+   FROM results WHERE student_id IS NOT NULL
+   ORDER BY student_id,percentage DESC,score DESC,created_at ASC
+ ), ranked AS (
+   SELECT ROW_NUMBER() OVER (ORDER BY percentage DESC,score DESC,created_at ASC)::int AS rank,mobile FROM best
+ ) SELECT rank FROM ranked WHERE mobile=$1 LIMIT 1`,[student.mobile]);
+ return res.json({leaderboard:q.rows,myRank:mr.rowCount?mr.rows[0].rank:null});
+}catch(e){res.status(500).json({error:e.message})}});
+
 
 // Compatibility endpoint for V3.1 APK while V3.2 is being installed.
 app.get('/api/questions',async(req,res)=>{try{if(!useDb)return res.json(readLocal('questions.json'));const ex=await pool.query(`SELECT id FROM exams WHERE active=true ORDER BY id LIMIT 1`);if(!ex.rowCount)return res.json([]);const q=await pool.query(`SELECT id,question,option_a AS a,option_b AS b,option_c AS c,option_d AS d,answer FROM questions WHERE exam_id=$1 ORDER BY id`,[ex.rows[0].id]);res.json(q.rows)}catch(e){res.status(500).json({error:e.message})}});
@@ -196,4 +221,4 @@ app.delete('/api/admin/pin-reset-requests/:id',async(req,res)=>{try{const id=req
 app.delete('/api/admin/results/:id',async(req,res)=>{try{const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid result id.'});if(useDb){const q=await pool.query('DELETE FROM results WHERE id=$1 RETURNING id',[id]);if(!q.rowCount)return res.status(404).json({error:'Result not found.'});return res.json({ok:true,message:'Result deleted.'})}res.status(501).json({error:'Database required.'})}catch(e){res.status(500).json({error:e.message})}});
 app.delete('/api/admin/students/:id',async(req,res)=>{try{const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid student id.'});if(!useDb)return res.status(501).json({error:'Database required.'});const c=await pool.connect();try{await c.query('BEGIN');const st=await c.query('SELECT mobile FROM students WHERE id=$1',[id]);if(!st.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Student not found.'})}const mobile=st.rows[0].mobile;await c.query('DELETE FROM exam_sessions WHERE student_id=$1',[id]);await c.query('DELETE FROM pin_reset_requests WHERE student_id=$1 OR mobile=$2',[id,mobile]);await c.query('DELETE FROM results WHERE student_id=$1 OR mobile=$2',[id,mobile]);await c.query('DELETE FROM students WHERE id=$1',[id]);await c.query('COMMIT');res.json({ok:true,message:'Student and linked data deleted.'})}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}catch(e){res.status(500).json({error:e.message})}});
 
-initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?'Postgres':'local JSON'}) - V3.5.9`))).catch(err=>{console.error('Database startup error:',err);process.exit(1)});
+initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?'Postgres':'local JSON'}) - V3.6.0`))).catch(err=>{console.error('Database startup error:',err);process.exit(1)});
