@@ -165,10 +165,16 @@ app.post('/api/my-results',async(req,res)=>{try{const student=await verifyStuden
 app.post('/api/leaderboard',async(req,res)=>{try{
  const student=await verifyStudent(norm(req.body?.mobile),String(req.body?.pin||''));
  if(!student)return res.status(401).json({error:'Invalid Mobile Number or PIN.'});
- if(!useDb)return res.json({leaderboard:[],myRank:null});
+ if(!useDb)return res.json({leaderboard:[],myRank:null,exams:[],selectedExamId:null});
+ const rawExamId=norm(req.body?.examId);
+ const examId=rawExamId&&rawExamId!=='0'?rawExamId:null;
+ if(examId&&!/^\d+$/.test(examId))return res.status(400).json({error:'Invalid exam.'});
+ const ex=await pool.query(`SELECT e.id,e.name FROM exams e WHERE EXISTS (SELECT 1 FROM results r WHERE r.exam_id=e.id) ORDER BY e.name ASC,e.id ASC`);
+ const filter=examId?' AND exam_id=$2':'';
+ const params=examId?[student.mobile,examId]:[student.mobile];
  const q=await pool.query(`WITH best AS (
    SELECT DISTINCT ON (student_id) student_id,name,mobile,percentage,score,total,COALESCE(exam_name,'Exam') AS exam_name,created_at
-   FROM results WHERE student_id IS NOT NULL
+   FROM results WHERE student_id IS NOT NULL${filter}
    ORDER BY student_id,percentage DESC,score DESC,created_at ASC
  ), ranked AS (
    SELECT ROW_NUMBER() OVER (ORDER BY percentage DESC,score DESC,created_at ASC)::int AS rank,
@@ -176,15 +182,15 @@ app.post('/api/leaderboard',async(req,res)=>{try{
    FROM best
  )
  SELECT rank,student_id AS "studentId",name,percentage,score,total,exam_name AS "examName",
-        (mobile=$1) AS "isMe" FROM ranked ORDER BY rank LIMIT 20`,[student.mobile]);
+        (mobile=$1) AS "isMe" FROM ranked ORDER BY rank LIMIT 20`,params);
  const mr=await pool.query(`WITH best AS (
    SELECT DISTINCT ON (student_id) student_id,mobile,percentage,score,created_at
-   FROM results WHERE student_id IS NOT NULL
+   FROM results WHERE student_id IS NOT NULL${filter}
    ORDER BY student_id,percentage DESC,score DESC,created_at ASC
  ), ranked AS (
    SELECT ROW_NUMBER() OVER (ORDER BY percentage DESC,score DESC,created_at ASC)::int AS rank,mobile FROM best
- ) SELECT rank FROM ranked WHERE mobile=$1 LIMIT 1`,[student.mobile]);
- return res.json({leaderboard:q.rows,myRank:mr.rowCount?mr.rows[0].rank:null});
+ ) SELECT rank FROM ranked WHERE mobile=$1 LIMIT 1`,params);
+ return res.json({leaderboard:q.rows,myRank:mr.rowCount?mr.rows[0].rank:null,exams:ex.rows,selectedExamId:examId?Number(examId):null});
 }catch(e){res.status(500).json({error:e.message})}});
 
 
