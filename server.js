@@ -95,6 +95,14 @@ CREATE INDEX IF NOT EXISTS idx_pin_reset_status ON pin_reset_requests(status,req
 CREATE TABLE IF NOT EXISTS question_reports(
  id BIGSERIAL PRIMARY KEY,question_id BIGINT NOT NULL,exam_id BIGINT,student_id BIGINT,student_name TEXT,mobile TEXT,
  reason TEXT NOT NULL DEFAULT 'Question issue',status TEXT NOT NULL DEFAULT 'OPEN',created_at TIMESTAMPTZ DEFAULT NOW(),resolved_at TIMESTAMPTZ);
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS exam_id BIGINT;
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS student_id BIGINT;
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS student_name TEXT;
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS mobile TEXT;
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT 'Question issue';
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'OPEN';
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE question_reports ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_question_reports_status ON question_reports(status,created_at DESC);
 CREATE TABLE IF NOT EXISTS admins(
  id BIGSERIAL PRIMARY KEY,admin_id TEXT UNIQUE NOT NULL,name TEXT NOT NULL DEFAULT 'Administrator',email TEXT,
@@ -299,4 +307,4 @@ app.delete('/api/admin/results',requireAdmin,async(req,res)=>{try{if(req.body?.c
 app.delete('/api/admin/results/:id',requireAdmin,async(req,res)=>{try{const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid result id.'});if(useDb){const q=await pool.query('UPDATE results SET deleted_at=NOW() WHERE id=$1 AND deleted_at IS NULL RETURNING id',[id]);if(!q.rowCount)return res.status(404).json({error:'Result not found.'});return res.json({ok:true,message:'Result removed. Dashboard history preserved.'})}res.status(501).json({error:'Database required.'})}catch(e){res.status(500).json({error:e.message})}});
 app.delete('/api/admin/students/:id',requireAdmin,async(req,res)=>{try{const id=req.params.id;if(!/^\d+$/.test(id))return res.status(400).json({error:'Invalid student id.'});if(!useDb)return res.status(501).json({error:'Database required.'});const c=await pool.connect();try{await c.query('BEGIN');const st=await c.query('SELECT mobile FROM students WHERE id=$1',[id]);if(!st.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Student not found.'})}const mobile=st.rows[0].mobile;await c.query('DELETE FROM exam_sessions WHERE student_id=$1',[id]);await c.query('DELETE FROM pin_reset_requests WHERE student_id=$1 OR mobile=$2',[id,mobile]);await c.query('UPDATE results SET deleted_at=COALESCE(deleted_at,NOW()) WHERE student_id=$1 OR mobile=$2',[id,mobile]);await c.query('DELETE FROM students WHERE id=$1',[id]);await c.query('COMMIT');res.json({ok:true,message:'Student removed. Lifetime dashboard and result history preserved.'})}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}catch(e){res.status(500).json({error:e.message})}});
 
-initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?'Postgres':'local JSON'}) - V3.8.4 API Compatibility Fix`))).catch(err=>{console.error('Database startup error:',err);process.exit(1)});
+initDb().then(()=>app.listen(PORT,()=>console.log(`CIE Exam Admin running on port ${PORT} (${useDb?'Postgres':'local JSON'}) - V3.8.5 Question Reports Migration Fix`))).catch(err=>{console.error('Database startup error:',err);process.exit(1)});
