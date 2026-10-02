@@ -1,6 +1,6 @@
 {
-  "name": "cie-exam-v3-4-app-management-thumbnails",
-  "version": "3.4.0",
+  "name": "cie-exam-v3-9-5-corrected",
+  "version": "3.9.5",
   "private": true,
   "scripts": {
     "start": "node server.js"
