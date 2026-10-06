@@ -1,6 +1,6 @@
 {
-  "name": "cie-exam-v3-9-6-final",
-  "version": "3.9.6",
+  "name": "cie-exam-website-v3-9-8",
+  "version": "3.9.8",
   "private": true,
   "scripts": {
     "start": "node server.js"
